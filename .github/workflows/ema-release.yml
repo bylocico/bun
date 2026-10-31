@@ -1,0 +1,477 @@
+# Builds and publishes a patched Bun release of this fork: upstream Bun plus the
+# fixes listed in EMA-PATCHES.md. Manual only: run it from the Actions tab, or
+# push a tag named like bun-v1.4.4-ema.1. See EMA-PATCHES.md.
+name: ema release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to create, e.g. bun-v1.4.4-ema.1. An existing tag is built as it is; otherwise the tag is created at the commit of the branch this runs on.
+        type: string
+        required: true
+      draft:
+        description: Create the GitHub release as a draft
+        type: boolean
+        default: false
+      push_docker:
+        description: Push Docker images to GHCR
+        type: boolean
+        default: true
+      lto:
+        description: Build with ThinLTO, as upstream's official releases are (slower, more memory)
+        type: boolean
+        default: false
+      build_runner:
+        description: Runner label for the builds. Must be arm64 Linux with Docker.
+        type: string
+        default: ubuntu-24.04-arm
+  push:
+    tags:
+      - "bun-v*-ema.*"
+
+permissions: {}
+
+concurrency:
+  group: ema-release
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      base_version: ${{ steps.resolve.outputs.base_version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      revision: ${{ steps.resolve.outputs.revision }}
+      draft: ${{ steps.resolve.outputs.draft }}
+      push_docker: ${{ steps.resolve.outputs.push_docker }}
+      lto: ${{ steps.resolve.outputs.lto }}
+      build_runner: ${{ steps.resolve.outputs.build_runner }}
+    steps:
+      - name: Resolve tag, commit and version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_DRAFT: ${{ inputs.draft }}
+          INPUT_DOCKER: ${{ inputs.push_docker }}
+          INPUT_LTO: ${{ inputs.lto }}
+          INPUT_RUNNER: ${{ inputs.build_runner }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ "$EVENT" = workflow_dispatch ]; then
+            tag=$INPUT_TAG
+            draft=$INPUT_DRAFT
+            push_docker=$INPUT_DOCKER
+            lto=$INPUT_LTO
+            runner=$INPUT_RUNNER
+          else
+            tag=$REF_NAME
+            draft=false
+            push_docker=true
+            lto=false
+            runner=ubuntu-24.04-arm
+          fi
+          if ! printf '%s' "$tag" | grep -Eqx 'bun-v[0-9]+\.[0-9]+\.[0-9]+-ema\.[0-9]+'; then
+            echo "::error::release tag must match bun-v<major>.<minor>.<patch>-ema.<n>"
+            exit 1
+          fi
+          if ! printf '%s' "$runner" | grep -Eqx '[A-Za-z0-9._-]+'; then
+            echo "::error::build_runner must be a single runner label"
+            exit 1
+          fi
+          version=${tag#bun-v}
+          base_version=${version%-ema.*}
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::release $tag already exists"
+            exit 1
+          fi
+
+          # An existing tag decides the commit; otherwise the run's own commit does,
+          # and the publish job creates the tag there.
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha 2>/dev/null || true)
+          if [ -z "$sha" ]; then
+            sha=$REF_SHA
+          fi
+
+          pkg_version=$(gh api "repos/$GITHUB_REPOSITORY/contents/package.json?ref=$sha" --jq .content | base64 -d | jq -r .version)
+          if [ "$pkg_version" != "$base_version" ]; then
+            echo "::error::$tag is for Bun $base_version, but package.json at $sha says $pkg_version"
+            exit 1
+          fi
+
+          revision="$base_version+$(printf '%s' "$sha" | cut -c1-9)"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "base_version=$base_version"
+            echo "sha=$sha"
+            echo "revision=$revision"
+            echo "draft=$draft"
+            echo "push_docker=$push_docker"
+            echo "lto=$lto"
+            echo "build_runner=$runner"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### $tag"
+            echo "- commit: \`$sha\`"
+            echo "- expected \`bun --revision\`: \`$revision\`"
+            echo "- draft: $draft, Docker: $push_docker, LTO: $lto, build runner: \`$runner\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: resolve
+    runs-on: ${{ needs.resolve.outputs.build_runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The targets upstream's .buildkite/ci.ts builds for a release, all
+        # cross-compiled from its arm64 Debian 13 build image. The -baseline
+        # assets are produced from the x64 builds by scripts/ema/build-target.sh.
+        target:
+          - bun-darwin-aarch64
+          - bun-darwin-x64
+          - bun-linux-x64
+          - bun-linux-aarch64
+          - bun-linux-x64-musl
+          - bun-linux-aarch64-musl
+          - bun-windows-x64
+          - bun-windows-aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force > /dev/null || true
+          df -h /
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Generate the build image's bake script
+        run: node scripts/build/ci-images/spec.ts linux-aarch64-debian
+
+      - name: Build in the Debian 13 build image
+        env:
+          TARGET: ${{ matrix.target }}
+          GIT_SHA: ${{ needs.resolve.outputs.sha }}
+          EMA_LTO: ${{ needs.resolve.outputs.lto == 'true' && 'on' || 'off' }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/src" -w /src \
+            -e GIT_SHA -e EMA_LTO \
+            debian:trixie \
+            sh scripts/ema/build-target.sh "$TARGET" dist
+          ls -l dist
+
+      - name: Upload
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: zip-${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  verify:
+    name: Verify ${{ matrix.asset }}
+    needs: [resolve, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { asset: bun-linux-x64, runner: ubuntu-24.04, image: "ubuntu:20.04", arch: x64, platform: linux, repro: true }
+          - { asset: bun-linux-x64-baseline, runner: ubuntu-24.04, image: "ubuntu:20.04", arch: x64, platform: linux, repro: false }
+          - { asset: bun-linux-aarch64, runner: ubuntu-24.04-arm, image: "ubuntu:20.04", arch: arm64, platform: linux, repro: true }
+          - { asset: bun-linux-x64-musl, runner: ubuntu-24.04, image: "alpine:3.23", arch: x64, platform: linux, repro: true }
+          - { asset: bun-linux-x64-musl-baseline, runner: ubuntu-24.04, image: "alpine:3.23", arch: x64, platform: linux, repro: false }
+          - { asset: bun-linux-aarch64-musl, runner: ubuntu-24.04-arm, image: "alpine:3.23", arch: arm64, platform: linux, repro: true }
+          - { asset: bun-darwin-aarch64, runner: macos-15, arch: arm64, platform: darwin, repro: true }
+          - { asset: bun-darwin-x64, runner: macos-15-intel, arch: x64, platform: darwin, repro: false }
+          - { asset: bun-darwin-x64-baseline, runner: macos-15-intel, arch: x64, platform: darwin, repro: false }
+          - { asset: bun-windows-x64, runner: windows-2025, arch: x64, platform: win32, repro: true }
+          - { asset: bun-windows-x64-baseline, runner: windows-2025, arch: x64, platform: win32, repro: false }
+          - { asset: bun-windows-aarch64, runner: windows-11-arm, arch: arm64, platform: win32, repro: true }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ema
+            test/ema
+
+      - name: Download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: zip-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check the archive layout
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -eu
+          case "$ASSET" in bun-windows-*) exe=bun.exe ;; *) exe=bun ;; esac
+          listing=$(cmake -E tar tf "dist/$ASSET.zip" | tr -d '\r' | sed 's,/$,,' | sort)
+          want=$(printf '%s\n%s\n' "$ASSET" "$ASSET/$exe" | sort)
+          if [ "$listing" != "$want" ]; then
+            echo "::error::$ASSET.zip holds:"; echo "$listing"; exit 1
+          fi
+          mkdir -p unpacked
+          (cd unpacked && cmake -E tar xf "../dist/$ASSET.zip")
+          chmod +x "unpacked/$ASSET/$exe"
+          echo "BUN=unpacked/$ASSET/$exe" >> "$GITHUB_ENV"
+
+      - name: Smoke test in ${{ matrix.image }}
+        if: matrix.image != ''
+        env:
+          IMAGE: ${{ matrix.image }}
+          VERSION: ${{ needs.resolve.outputs.base_version }}
+          REVISION: ${{ needs.resolve.outputs.revision }}
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          REPRO: ${{ matrix.repro && 'test/ema/expect-rejects-setimmediate-stall.test.ts' || '' }}
+        run: |
+          set -eu
+          case "$IMAGE" in alpine:*) prepare='apk add --no-cache libgcc libstdc++ > /dev/null' ;; *) prepare=true ;; esac
+          docker run --rm -v "$PWD:/w:ro" -w /w \
+            -e BUN -e VERSION -e REVISION -e ARCH -e PLATFORM -e REPRO \
+            "$IMAGE" sh -c "$prepare"' && sh scripts/ema/smoke-test.sh "/w/$BUN" "$VERSION" "$REVISION" "$ARCH" "$PLATFORM" ${REPRO:+"/w/$REPRO"}'
+
+      - name: Smoke test on ${{ matrix.runner }}
+        if: matrix.image == ''
+        env:
+          VERSION: ${{ needs.resolve.outputs.base_version }}
+          REVISION: ${{ needs.resolve.outputs.revision }}
+          ARCH: ${{ matrix.arch }}
+          PLATFORM: ${{ matrix.platform }}
+          REPRO: ${{ matrix.repro && 'test/ema/expect-rejects-setimmediate-stall.test.ts' || '' }}
+        run: |
+          set -eu
+          sh scripts/ema/smoke-test.sh "$PWD/$BUN" "$VERSION" "$REVISION" "$ARCH" "$PLATFORM" ${REPRO:+"$PWD/$REPRO"}
+
+  publish:
+    name: Publish GitHub release
+    needs: [resolve, verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/ema
+
+      - name: Download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: zip-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write SHASUMS256.txt
+        working-directory: dist
+        run: |
+          set -eu
+          expected="bun-darwin-aarch64 bun-darwin-x64 bun-darwin-x64-baseline bun-linux-x64 bun-linux-x64-baseline bun-linux-aarch64 bun-linux-x64-musl bun-linux-x64-musl-baseline bun-linux-aarch64-musl bun-windows-x64 bun-windows-x64-baseline bun-windows-aarch64"
+          for name in $expected; do
+            [ -f "$name.zip" ] || { echo "::error::missing $name.zip"; exit 1; }
+          done
+          [ "$(find . -maxdepth 1 -name '*.zip' | wc -l)" -eq 12 ] || { echo "::error::unexpected files:"; ls -l; exit 1; }
+          # packages/bun-release/scripts/upload-assets.ts: "<sha256>  <name>", sorted by localeCompare, joined by "\n".
+          # shellcheck disable=SC2016
+          node -e '
+            const { createHash } = require("node:crypto");
+            const fs = require("node:fs");
+            const lines = fs.readdirSync(".").filter(n => n.endsWith(".zip"))
+              .map(n => [n, createHash("sha256").update(fs.readFileSync(n)).digest("hex")])
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([n, h]) => `${h}  ${n}`);
+            fs.writeFileSync("SHASUMS256.txt", lines.join("\n"));
+          '
+          cat SHASUMS256.txt; echo
+          sha256sum -c SHASUMS256.txt
+
+      - name: Upload SHASUMS256.txt for the Docker job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shasums
+          path: dist/SHASUMS256.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          BASE_VERSION: ${{ needs.resolve.outputs.base_version }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          REVISION: ${{ needs.resolve.outputs.revision }}
+          DRAFT: ${{ needs.resolve.outputs.draft }}
+          LTO: ${{ needs.resolve.outputs.lto == 'true' && 'on' || 'off' }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          owner=$(printf '%s' "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+          sed -e "s|@BASE_TAG@|bun-v$BASE_VERSION|g" -e "s|@BASE_VERSION@|$BASE_VERSION|g" \
+            -e "s|@VERSION@|$VERSION|g" -e "s|@REVISION@|$REVISION|g" -e "s|@SHA@|$SHA|g" \
+            -e "s|@REPOSITORY@|$GITHUB_REPOSITORY|g" -e "s|@RUN_ID@|$RUN_ID|g" -e "s|@LTO@|$LTO|g" \
+            -e "s|@IMAGE_OWNER@|$owner|g" \
+            scripts/ema/release-notes.md > notes.md
+          draft_flag=
+          if [ "$DRAFT" = true ]; then draft_flag=--draft; fi
+          # --target only applies when the tag does not exist yet.
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --prerelease \
+            --latest=false \
+            $draft_flag \
+            --title "$TAG (Patched Bun — not an official oven-sh release)" \
+            --notes-file notes.md \
+            dist/*.zip dist/SHASUMS256.txt
+
+  docker:
+    name: Docker ${{ matrix.variant }}
+    needs: [resolve, publish]
+    if: needs.resolve.outputs.push_docker == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: debian
+            zips: "bun-linux-x64-baseline bun-linux-aarch64"
+            # "none" is the plain <version> tag, which upstream also gives the Debian image.
+            suffixes: "none -debian"
+          - variant: alpine
+            zips: "bun-linux-x64-musl-baseline bun-linux-aarch64-musl"
+            suffixes: "-alpine"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            dockerhub
+            scripts/ema
+
+      - name: Download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "{zip-*,shasums}"
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble the build context
+        id: context
+        env:
+          VARIANT: ${{ matrix.variant }}
+          ZIPS: ${{ matrix.zips }}
+          SUFFIXES: ${{ matrix.suffixes }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -eu
+          mkdir context
+          cp "dockerhub/$VARIANT/docker-entrypoint.sh" dist/SHASUMS256.txt context/
+          for zip in $ZIPS; do cp "dist/$zip.zip" context/; done
+          ls -l context
+          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          tags=
+          for suffix in $SUFFIXES; do
+            if [ "$suffix" = none ]; then suffix=; fi
+            tags="$tags$image:$VERSION$suffix,"
+          done
+          {
+            echo "image=$image"
+            echo "tags=${tags%,}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Setup Docker buildx
+        id: buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: context
+          file: scripts/ema/docker/${{ matrix.variant }}.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          builder: ${{ steps.buildx.outputs.name }}
+          push: true
+          tags: ${{ steps.context.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.title=bun (patched)
+            org.opencontainers.image.description=Patched Bun ${{ needs.resolve.outputs.version }}, not an official oven-sh image
+
+      - name: Check the pushed images
+        env:
+          TAGS: ${{ steps.context.outputs.tags }}
+          REVISION: ${{ needs.resolve.outputs.revision }}
+        run: |
+          set -eu
+          for tag in $(printf '%s' "$TAGS" | tr ',' ' '); do
+            for platform in linux/amd64 linux/arm64; do
+              got=$(docker run --rm --pull always --platform "$platform" "$tag" bun --revision)
+              echo "$tag ($platform): $got"
+              [ "$got" = "$REVISION" ] || { echo "::error::$tag ($platform) reports $got, want $REVISION"; exit 1; }
+            done
+          done
