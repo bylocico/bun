@@ -43,7 +43,11 @@ One-time setup of the repository:
 2. Keep upstream's workflows disabled: run `scripts/ema-disable-upstream-workflows.sh` (needs `gh`,
    authenticated as a repository admin). Re-run it after **every** sync of the fork with upstream:
    a sync can add workflow files, and GitHub starts each new workflow out active.
-3. After the first release, make the container package public, once: the organization's Packages →
+3. To run the workflow from the Actions tab or `gh workflow run`, make `ema-v1.4.<x>` the fork's
+   default branch (Settings → General → Default branch). GitHub only offers `workflow_dispatch` for
+   workflows on the default branch, and only lists a workflow there after it is on the default
+   branch or has run. Pushing a release tag works whatever the default branch is.
+4. After the first release, make the container package public, once: the organization's Packages →
    `bun` → Package settings → Change visibility → Public. (The organization must allow public
    packages.)
 
@@ -51,8 +55,8 @@ Each release:
 
 1. Make sure the release branch is pushed, then either:
    - Actions → **ema release** → Run workflow, on branch `ema-v1.4.4`, with `release_tag`
-     `bun-v1.4.4-ema.<n>`. The tag is created at the branch's commit when the release is published;
-     or
+     `bun-v1.4.4-ema.<n>` (needs step 3). The tag is created at the branch's commit when the release
+     is published; or
    - push a tag yourself: `git tag bun-v1.4.4-ema.<n> ema-v1.4.4 && git push bylocico bun-v1.4.4-ema.<n>`.
 2. The workflow builds the 8 targets, verifies all 12 assets, creates a **prerelease** with the zips
    and `SHASUMS256.txt`, then pushes `ghcr.io/bylocico/bun:<version>`, `:<version>-debian` and
