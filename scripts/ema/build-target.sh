@@ -43,10 +43,6 @@ case "$target" in
 esac
 case "$lto" in on | off) ;; *) echo "error: EMA_LTO must be on or off" >&2; exit 2 ;; esac
 
-git config --global --add safe.directory "$repo"
-GIT_SHA=${GIT_SHA:-$(git rev-parse HEAD)}
-export GIT_SHA
-
 bake_dir=${EMA_BAKE_DIR:-$repo/build/ci-images/linux-aarch64-debian}
 if [ ! -f "$bake_dir/bootstrap.sh" ]; then
   node scripts/build/ci-images/spec.ts linux-aarch64-debian
@@ -56,6 +52,11 @@ fi
 # The sections every build needs, then the target's sysroot or SDK.
 # shellcheck disable=SC2086
 sh scripts/ema/bake.sh "$bake_dir" packages agent-account nodejs bun bun-ninja cmake llvm rust $sections
+
+# git comes from the bake's packages section; the base image has none.
+git config --global --add safe.directory "$repo"
+GIT_SHA=${GIT_SHA:-$(git rev-parse HEAD)}
+export GIT_SHA
 
 # shellcheck disable=SC1091
 . /etc/profile.d/bun-ci.sh
