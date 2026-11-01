@@ -56,6 +56,7 @@ jobs:
     steps:
       - name: Resolve tag, commit and version
         id: resolve
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
@@ -81,11 +82,12 @@ jobs:
             lto=false
             runner=ubuntu-24.04-arm
           fi
-          if ! printf '%s' "$tag" | grep -Eqx 'bun-v[0-9]+\.[0-9]+\.[0-9]+-ema\.[0-9]+'; then
+          # [[ =~ ]] matches the whole value; grep would accept one good line of several.
+          if ! [[ "$tag" =~ ^bun-v[0-9]+\.[0-9]+\.[0-9]+-ema\.[0-9]+$ ]]; then
             echo "::error::release tag must match bun-v<major>.<minor>.<patch>-ema.<n>"
             exit 1
           fi
-          if ! printf '%s' "$runner" | grep -Eqx '[A-Za-z0-9._-]+'; then
+          if ! [[ "$runner" =~ ^[A-Za-z0-9._-]+$ ]]; then
             echo "::error::build_runner must be a single runner label"
             exit 1
           fi
@@ -99,8 +101,9 @@ jobs:
 
           # An existing tag decides the commit; otherwise the run's own commit does,
           # and the publish job creates the tag there.
-          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/refs/tags/$tag" --jq .sha 2>/dev/null || true)
-          if [ -z "$sha" ]; then
+          # (On an error gh prints the error body to stdout, hence the pattern check.)
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$tag" --jq .sha 2>/dev/null || true)
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
             sha=$REF_SHA
           fi
 
@@ -161,9 +164,11 @@ jobs:
       - name: Free disk space
         run: |
           df -h /
+          # Preinstalled SDKs the build does not use. The build image, the WebKit
+          # prebuilt and the build directory need tens of GB.
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift /usr/local/share/powershell \
-            /usr/local/share/chromium /usr/local/lib/node_modules || true
+            /usr/local/share/boost /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /opt/hostedtoolcache/CodeQL || true
           sudo docker image prune --all --force > /dev/null || true
           df -h /
 
